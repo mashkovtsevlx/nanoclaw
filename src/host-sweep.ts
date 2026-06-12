@@ -29,6 +29,7 @@
 import type Database from 'better-sqlite3';
 import fs from 'fs';
 
+import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
@@ -46,6 +47,17 @@ import { log } from './log.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
+
+/**
+ * SQLite TIMESTAMP columns store UTC without a timezone marker. Date.parse
+ * treats timezoneless ISO strings as local time, so on non-UTC hosts every
+ * timestamp looks (TZ offset) hours stale — leading to spurious kill-claim
+ * decisions on freshly-claimed messages. Append "Z" when no zone marker is
+ * present so Date.parse interprets the string as UTC.
+ */
+export function parseSqliteUtc(s: string): number {
+  return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z');
+}
 
 const SWEEP_INTERVAL_MS = 60_000;
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
@@ -95,7 +107,7 @@ export function decideStuckAction(args: {
 
   const tolerance = Math.max(CLAIM_STUCK_MS, declaredBashMs ?? 0);
   for (const claim of claims) {
-    const claimedAt = Date.parse(claim.status_changed);
+    const claimedAt = parseSqliteUtc(claim.status_changed);
     if (Number.isNaN(claimedAt)) continue;
     const claimAge = now - claimedAt;
     if (claimAge <= tolerance) continue;
@@ -120,6 +132,16 @@ export function stopHostSweep(): void {
 
 async function sweep(): Promise<void> {
   if (!running) return;
+
+  // Re-heal the egress network so already-running agents keep their gateway hop
+  // if it was detached out-of-band. Best-effort here: a heal failure isn't a
+  // leak (agents stay on the internal net), so log and continue. No-op when
+  // lockdown is disabled.
+  try {
+    ensureEgressNetwork();
+  } catch (err) {
+    log.error('Egress lockdown re-heal failed', { err });
+  }
 
   try {
     const sessions = getActiveSessions();
@@ -167,17 +189,23 @@ async function sweepSession(session: Session): Promise<void> {
     // would keep bumping process_after into the future, dueCount would stay 0,
     // and the wake would never fire.
     const dueCount = countDueMessages(inDb);
+    let justWoke = false;
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       // wakeContainer never throws — transient spawn failures (OneCLI down,
       // etc.) return false and leave messages pending for the next tick.
       await wakeContainer(session);
+      justWoke = true;
     }
 
     const alive = isContainerRunning(session.id);
 
     // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
-    if (alive && outDb) {
+    // Skip on the same iteration that just woke the container — it hasn't
+    // had a chance to clear stale processing_ack rows from a previous crash
+    // yet. Without this grace period, stale claims cause an immediate
+    // spawn-kill loop.
+    if (alive && outDb && !justWoke) {
       enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
     }
 
@@ -256,7 +284,7 @@ export function _resetStuckProcessingRowsForTesting(
   session: Session,
   reason: string,
 ): void {
-  resetStuckProcessingRows(inDb, outDb, session, reason);
+  resetStuckProcessingRows(inDb, outDb, session, reason, outDb);
 }
 
 function resetStuckProcessingRows(
@@ -264,6 +292,7 @@ function resetStuckProcessingRows(
   outDb: Database.Database,
   session: Session,
   reason: string,
+  writableOutDb?: Database.Database,
 ): void {
   const claims = getProcessingClaims(outDb);
   const now = Date.now();
@@ -274,7 +303,7 @@ function resetStuckProcessingRows(
     // Already rescheduled for a future retry — don't bump tries again. The
     // wake path (sweep step 2) will fire when process_after elapses and a
     // fresh container will clean the orphan claim on startup.
-    if (msg.processAfter && Date.parse(msg.processAfter) > now) continue;
+    if (msg.processAfter && parseSqliteUtc(msg.processAfter) > now) continue;
 
     if (msg.tries >= MAX_TRIES) {
       markMessageFailed(inDb, msg.id);
@@ -300,19 +329,17 @@ function resetStuckProcessingRows(
   // would re-read them, see the old status_changed timestamp, conclude the
   // freshly respawned container is stuck, and SIGKILL it before its
   // agent-runner has a chance to run clearStaleProcessingAcks() on startup.
-  // We're safe to write outbound.db here because we just killed the container
-  // that owned it (or it crashed and left no writer behind).
-  // outDb was opened readonly for reads above; reopen with write access for this delete.
-  let outDbRw: Database.Database | null = null;
+  const ownsDb = !writableOutDb;
+  let useDb: Database.Database | null = writableOutDb ?? null;
   try {
-    outDbRw = openOutboundDbRw(session.agent_group_id, session.id);
-    const cleared = deleteOrphanProcessingClaims(outDbRw);
+    if (!useDb) useDb = openOutboundDbRw(session.agent_group_id, session.id);
+    const cleared = deleteOrphanProcessingClaims(useDb);
     if (cleared > 0) {
       log.info('Cleared orphan processing claims', { sessionId: session.id, cleared, reason });
     }
   } catch (err) {
     log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
   } finally {
-    outDbRw?.close();
+    if (ownsDb) useDb?.close();
   }
 }
