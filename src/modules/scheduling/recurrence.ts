@@ -16,7 +16,12 @@ import type Database from 'better-sqlite3';
 import { TIMEZONE } from '../../config.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { clearRecurrence, getCompletedRecurring, insertRecurrence } from './db.js';
+import {
+  clearRecurrence,
+  getCompletedRecurring,
+  insertRecurrence,
+  pruneCompletedScheduling,
+} from './db.js';
 
 export async function handleRecurrence(inDb: Database.Database, session: Session): Promise<void> {
   const recurring = getCompletedRecurring(inDb);
@@ -50,5 +55,12 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
         err,
       });
     }
+  }
+
+  // Bounded retention: trim inert completed task/system history so recurring
+  // tasks can't accumulate unboundedly in inbound.db (see pruneCompletedScheduling).
+  const pruned = pruneCompletedScheduling(inDb);
+  if (pruned > 0) {
+    log.debug('Pruned completed scheduling rows', { pruned, sessionId: session.id });
   }
 }

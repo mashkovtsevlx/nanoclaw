@@ -151,3 +151,34 @@ export function insertRecurrence(
 export function clearRecurrence(db: Database.Database, messageId: string): void {
   db.prepare('UPDATE messages_in SET recurrence = NULL WHERE id = ?').run(messageId);
 }
+
+/**
+ * Bounded retention for completed automation rows.
+ *
+ * A recurring task leaves one `completed` row behind per occurrence (its
+ * recurrence is cleared on fanout — see handleRecurrence), and nothing else
+ * ever removes them. A per-minute task therefore accumulates ~1.4k rows/day
+ * indefinitely, bloating inbound.db and slowing every sweep query. These rows
+ * are inert history: the agent only reads pending rows, and the live schedule
+ * lives in the pending occurrence, so trimming old completed task/system rows
+ * is safe. Keeps the newest `keepLast` by seq (monotonic — timestamps are
+ * stored in mixed formats and can't be range-compared reliably). Returns the
+ * number of rows deleted. Never touches pending/paused rows or any row that
+ * still carries a recurrence.
+ */
+export function pruneCompletedScheduling(db: Database.Database, keepLast = 500): number {
+  const info = db
+    .prepare(
+      `DELETE FROM messages_in
+        WHERE kind IN ('task', 'system')
+          AND status = 'completed'
+          AND (recurrence IS NULL OR recurrence = '')
+          AND seq NOT IN (
+            SELECT seq FROM messages_in
+             WHERE kind IN ('task', 'system') AND status = 'completed'
+             ORDER BY seq DESC LIMIT ?
+          )`,
+    )
+    .run(keepLast);
+  return info.changes;
+}
