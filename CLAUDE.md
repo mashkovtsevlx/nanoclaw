@@ -211,6 +211,25 @@ git log upstream/main..HEAD --oneline
 
 Show the output and wait for approval. Installation-specific files (group files, .claude/settings.json, local configs) should not be included.
 
+## Reaching the Host Pi (`core`)
+
+This install runs on a Pi 4 reached over SSH. Use the multiplexed `core` alias — a shared
+ControlMaster socket makes each call ~30ms instead of a ~1s handshake, so it feels interactive.
+
+```bash
+ssh core '<cmd>'      # run a command (multiplexed, fast)
+ssh core              # interactive shell
+ssh -O check core     # is the shared master connection alive?
+ssh -O stop core      # tear down the socket (e.g. after a Wi-Fi drop wedges it)
+```
+
+`~/.ssh/config` (`Host core`): `HostName 192.168.8.195` (the IP, not `core.local` — mDNS is
+flaky over the GL-iNet Wi-Fi; router auto-reboots ~05:00 WITA, so update this line if the IP
+changes), `ControlMaster auto`, `ControlPath ~/.ssh/sockets/%r@%h:%p`, `ControlPersist 10m`,
+`ServerAliveInterval 15` / `ServerAliveCountMax 4` (survives brief Wi-Fi blips).
+
+Old Pi (SD-boot, retired-but-kept as rollback): `alex@192.168.8.60` (hostname `rpi`).
+
 ## Development
 
 Run commands directly — don't tell the user to run them.
