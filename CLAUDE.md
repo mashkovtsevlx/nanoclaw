@@ -230,6 +230,41 @@ changes), `ControlMaster auto`, `ControlPath ~/.ssh/sockets/%r@%h:%p`, `ControlP
 
 Old Pi (SD-boot, retired-but-kept as rollback): `alex@192.168.8.60` (hostname `rpi`).
 
+Ethernet: `192.168.8.194` (`eth0`) — `.195` is `wlan0`. Use the eth path when changing Wi-Fi
+settings, or you cut your own SSH session.
+
+**If NanoClaw is up but not replying, read [docs/rpi-host-gotchas.md](docs/rpi-host-gotchas.md)
+before debugging.** Pi-specific failure modes (Wi-Fi power-save blackholing Telegram long-polls,
+volatile journald, user units racing the network at boot) all present as a green, healthy host
+that silently never answers — and several obvious checks actively mislead.
+
+### Tailscale (remote access from anywhere)
+
+The Pi is on the tailnet `tailc69f61.ts.net` as node **`paios`** (`100.72.216.124`), so it's
+reachable off-LAN without port forwarding. Tailscale SSH is enabled — any device on the tailnet
+can connect with no key setup:
+
+```bash
+ssh alex@paios                       # SSH over the tailnet (MagicDNS), works from anywhere
+tailscale ping paios                 # check the path / latency
+open https://paios.tailc69f61.ts.net # OneCLI web UI, HTTPS, tailnet-only (see below)
+```
+
+The **OneCLI web UI** (bound to the Docker bridge `172.17.0.1:10254`, so not reachable on the LAN)
+is proxied over the tailnet via `tailscale serve`: `https://paios.tailc69f61.ts.net` → private to
+your tailnet, not public. It survives reboots (config persisted; `tailscaled` is an enabled
+systemd unit). Manage it on the Pi:
+
+```bash
+ssh core 'sudo tailscale serve status'                          # show the proxy
+ssh core 'sudo tailscale serve --https=443 off'                 # remove it
+ssh core 'sudo tailscale serve --bg --https=443 http://172.17.0.1:10254'  # re-add
+```
+
+Notes: brought up with `sudo tailscale up --ssh --hostname=paios --accept-dns=false`
+(`--accept-dns=false` so Tailscale doesn't clobber the Pi's working DNS resolver). The LAN `core`
+alias above is still the fast path on the home network; use `paios` when off-LAN.
+
 ## Development
 
 Run commands directly — don't tell the user to run them.
@@ -296,6 +331,7 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 | [docs/build-and-runtime.md](docs/build-and-runtime.md) | Runtime split (Node host + Bun container), lockfiles, image build surface, CI, key invariants |
 | [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) | v1→v2 architecture diff — vocabulary for where v1 things moved |
 | [docs/migration-dev.md](docs/migration-dev.md) | Migration development guide — testing, debugging, dev loop |
+| [docs/rpi-host-gotchas.md](docs/rpi-host-gotchas.md) | Raspberry Pi host gotchas — silent-stall failure modes, new-Pi checklist, misleading checks |
 | [docs/provider-migration.md](docs/provider-migration.md) | Switching a live agent group between providers (e.g. Claude → Codex) — what carries over, rollback |
 | [docs/customizing.md](docs/customizing.md) | Short intro to customizing via skills |
 | [docs/skills-model.md](docs/skills-model.md) | The skills model in full: recipes, tests, upgrades, migrations |
