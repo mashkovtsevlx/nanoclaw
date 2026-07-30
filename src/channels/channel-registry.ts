@@ -85,8 +85,14 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
     ): Promise<string | undefined> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       if (!adapter) {
+        // THROW, don't return: returning undefined here reads as a successful
+        // send to drainSession, which then marks the row delivered with a NULL
+        // platform_message_id — the reply is dropped with no retry and no
+        // failure record, while the DB looks healthy. Throwing puts the row on
+        // the normal retry → failed path this function's contract promises.
+        // See nanocoai/nanoclaw#2995.
         log.warn('No adapter for channel type', { channelType, instance });
-        return;
+        throw new Error(`no channel adapter registered for ${instance ?? channelType}`);
       }
       return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
     },

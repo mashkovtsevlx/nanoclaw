@@ -207,16 +207,20 @@ describe('channel registry — instance keying', () => {
     // message (instance === channelType after backfill) is dropped, not
     // delivered through the sibling's identity.
     const bridge = reg.createChannelDeliveryAdapter();
-    const result = await bridge.deliver(
-      'slack',
-      'slack:C1',
-      null,
-      'chat',
-      JSON.stringify({ text: 'to the default bot' }),
-      undefined,
-      'slack',
-    );
-    expect(result).toBeUndefined();
+    // It throws rather than returning undefined: a silent return reads as a
+    // successful send and the row gets marked delivered (#2995). Throwing is
+    // what puts it on the retry path this test's premise describes.
+    await expect(
+      bridge.deliver(
+        'slack',
+        'slack:C1',
+        null,
+        'chat',
+        JSON.stringify({ text: 'to the default bot' }),
+        undefined,
+        'slack',
+      ),
+    ).rejects.toThrow(/no channel adapter registered/);
     expect(tester.delivered).toHaveLength(0);
 
     // Sanity: the same bridge DOES deliver when the exact instance is live.
