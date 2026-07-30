@@ -291,8 +291,15 @@ async function drainSession(session: Session): Promise<void> {
     for (const msg of undelivered) {
       // Honor per-message backoff: a message that just failed a transient
       // send is not retried until its backoff window has elapsed.
+      //
+      // `break`, not `continue`: getDueOutboundMessages returns rows in
+      // timestamp order, and a reply that overtakes an earlier one reads as
+      // incoherent in a chat transcript. So a backed-off message holds the
+      // line for its session rather than letting later messages pass it.
+      // Head-of-line blocking is bounded by the same retry policy that put
+      // the message here - once it sends or gives up, the queue drains.
       const backoffState = deliveryAttempts.get(msg.id);
-      if (backoffState && backoffState.nextRetryAt > Date.now()) continue;
+      if (backoffState && backoffState.nextRetryAt > Date.now()) break;
 
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
@@ -330,6 +337,8 @@ async function drainSession(session: Session): Promise<void> {
           });
           markDeliveryFailed(inDb, msg.id);
           deliveryAttempts.delete(msg.id);
+          // Given up: this row is out of the queue, so the messages behind it
+          // are free to go.
         } else {
           const retryInMs = transient ? retryBackoffMs(attempts) : 0;
           deliveryAttempts.set(msg.id, { attempts, firstFailedAt, nextRetryAt: now + retryInMs });
@@ -341,6 +350,11 @@ async function drainSession(session: Session): Promise<void> {
             retryInMs,
             err,
           });
+          // Still queued for retry, so stop draining here — same ordering
+          // guarantee as the backoff check above. Without this, the messages
+          // behind it would be delivered in this very cycle and arrive before
+          // the reply they follow.
+          break;
         }
       }
     }

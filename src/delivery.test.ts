@@ -36,7 +36,8 @@ import {
 } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
-import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
+import { deliverSessionMessages, setDeliveryAdapter, isTransientDeliveryError } from './delivery.js';
+import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -156,40 +157,174 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 });
 
 describe('deliverSessionMessages — retry and permanent failure', () => {
-  it('retries on adapter failure and marks failed after MAX_DELIVERY_ATTEMPTS (3)', async () => {
+  it('keeps retrying a transient (network) failure past the old 3-attempt cap', async () => {
+    // Regression for silent drops on flaky links: a brief connectivity gap
+    // used to permanently drop the reply after 3 fast retries. Transient
+    // failures must now keep retrying (with backoff) within the horizon.
+    vi.useFakeTimers();
+    try {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-net');
+
+      let callCount = 0;
+      setDeliveryAdapter({
+        async deliver() {
+          callCount++;
+          throw Object.assign(new Error('Network error calling Telegram sendMessage'), { type: 'NetworkError' });
+        },
+      });
+
+      // Drive several poll cycles, advancing past the (capped) backoff each time.
+      for (let i = 0; i < 6; i++) {
+        await deliverSessionMessages(session);
+        vi.advanceTimersByTime(60_000);
+      }
+
+      expect(callCount).toBeGreaterThan(3);
+      const inDb = openInboundDb('ag-1', session.id);
+      const failed = getDeliveredIds(inDb).has('out-net');
+      inDb.close();
+      expect(failed).toBe(false); // not permanently dropped within the horizon
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives up on a transient failure once the retry horizon elapses', async () => {
+    vi.useFakeTimers();
+    try {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-net-long');
+
+      setDeliveryAdapter({
+        async deliver() {
+          throw Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' });
+        },
+      });
+
+      await deliverSessionMessages(session); // stamps firstFailedAt
+      vi.advanceTimersByTime(31 * 60_000); // past the 30-min horizon
+      await deliverSessionMessages(session); // this cycle gives up
+
+      const inDb = openInboundDb('ag-1', session.id);
+      const failed = getDeliveredIds(inDb).has('out-net-long');
+      inDb.close();
+      expect(failed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('marks a structural (validation) failure failed after MAX_PERMANENT_ATTEMPTS (3)', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertOutbound('ag-1', session.id, 'out-flaky');
+    insertOutbound('ag-1', session.id, 'out-bad');
 
     let callCount = 0;
     setDeliveryAdapter({
       async deliver() {
         callCount++;
-        throw new Error('network timeout');
+        throw Object.assign(new Error('Bad Request: message is too long'), { type: 'ValidationError' });
       },
     });
 
-    // Attempt 1
     await deliverSessionMessages(session);
-    expect(callCount).toBe(1);
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session); // 3rd attempt → permanent failure
+    await deliverSessionMessages(session); // no-op, already marked failed
 
-    // Attempt 2
-    await deliverSessionMessages(session);
-    expect(callCount).toBe(2);
-
-    // Attempt 3 — should mark as permanently failed
-    await deliverSessionMessages(session);
     expect(callCount).toBe(3);
-
-    // Attempt 4 — message is now in delivered (as failed), adapter not called
-    await deliverSessionMessages(session);
-    expect(callCount).toBe(3);
-
-    // Verify the message is in the delivered table with 'failed' status
     const inDb = openInboundDb('ag-1', session.id);
-    const delivered = getDeliveredIds(inDb);
+    const failed = getDeliveredIds(inDb).has('out-bad');
     inDb.close();
-    expect(delivered.has('out-flaky')).toBe(true);
+    expect(failed).toBe(true);
+  });
+
+  it("treats a 'can't parse entities' rejection as transient, not structural", async () => {
+    // The formatter escapes its own output, so well-formed markup can only
+    // fail to parse if the request was truncated in transit. Retry it instead
+    // of dropping the reply after 3 fast attempts.
+    vi.useFakeTimers();
+    try {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-parse');
+
+      let callCount = 0;
+      setDeliveryAdapter({
+        async deliver() {
+          callCount++;
+          throw Object.assign(new Error("Bad Request: can't parse entities: Can't find end of a URL"), {
+            type: 'ValidationError',
+          });
+        },
+      });
+
+      for (let i = 0; i < 5; i++) {
+        await deliverSessionMessages(session);
+        vi.advanceTimersByTime(60_000);
+      }
+
+      expect(callCount).toBeGreaterThan(3);
+      const inDb = openInboundDb('ag-1', session.id);
+      const failed = getDeliveredIds(inDb).has('out-parse');
+      inDb.close();
+      expect(failed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds the line for a backed-off message instead of letting later ones overtake it', async () => {
+    // Replies must stay in order: while message 1 is in transient backoff,
+    // message 2 waits behind it rather than being delivered first.
+    vi.useFakeTimers();
+    try {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      const db = new Database(outboundDbPath('ag-1', session.id));
+      const insertAt = (id: string, ts: string) =>
+        db
+          .prepare(
+            `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+             VALUES (?, ?, 'chat', 'telegram:123', 'telegram', ?)`,
+          )
+          .run(id, ts, JSON.stringify({ text: id }));
+      insertAt('out-first', '2026-07-30T10:00:00Z');
+      insertAt('out-second', '2026-07-30T10:00:05Z');
+      db.close();
+
+      const sent: string[] = [];
+      let failFirst = true;
+      setDeliveryAdapter({
+        async deliver(_c, _p, _t, _k, content) {
+          const text = JSON.parse(content).text as string;
+          if (text === 'out-first' && failFirst) {
+            throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+          }
+          sent.push(text);
+          return 'pm';
+        },
+      });
+
+      // Cycle 1: message 1 fails and enters backoff.
+      await deliverSessionMessages(session);
+      expect(sent).toEqual([]);
+
+      // Cycle 2, still inside the backoff window: message 2 must NOT jump ahead.
+      await deliverSessionMessages(session);
+      expect(sent).toEqual([]);
+
+      // Backoff elapses and message 1 succeeds — then message 2 follows, in order.
+      failFirst = false;
+      vi.advanceTimersByTime(60_000);
+      await deliverSessionMessages(session);
+      expect(sent).toEqual(['out-first', 'out-second']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('clears attempt counter on successful delivery', async () => {
@@ -217,6 +352,52 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     // Attempt 3 — not called, message already delivered
     await deliverSessionMessages(session);
     expect(callCount).toBe(2);
+  });
+});
+
+describe('isTransientDeliveryError', () => {
+  it('classifies network/timeout/5xx/429 failures as transient', () => {
+    expect(isTransientDeliveryError(Object.assign(new Error('x'), { type: 'NetworkError' }))).toBe(true);
+    expect(isTransientDeliveryError(Object.assign(new Error('x'), { code: 'ETIMEDOUT' }))).toBe(true);
+    expect(isTransientDeliveryError(Object.assign(new Error('x'), { code: 'ECONNRESET' }))).toBe(true);
+    expect(isTransientDeliveryError(Object.assign(new Error('x'), { code: 'EAI_AGAIN' }))).toBe(true);
+    expect(isTransientDeliveryError(Object.assign(new Error('x'), { status: 503 }))).toBe(true);
+    expect(isTransientDeliveryError(Object.assign(new Error('x'), { status: 429 }))).toBe(true);
+    expect(isTransientDeliveryError(new Error('socket hang up'))).toBe(true);
+    expect(isTransientDeliveryError(new Error('fetch failed'))).toBe(true);
+  });
+
+  it('classifies a truncated-request parse rejection as transient', () => {
+    // A lossy uplink cuts the request mid-flight; the content itself is fine.
+    expect(
+      isTransientDeliveryError(
+        Object.assign(new Error("Bad Request: can't parse entities: Can't find end of a URL entity"), {
+          type: 'ValidationError',
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('classifies structural / permission / unknown failures as permanent', () => {
+    expect(
+      isTransientDeliveryError(
+        Object.assign(new Error('Bad Request: message is too long'), { type: 'ValidationError' }),
+      ),
+    ).toBe(false);
+    expect(
+      isTransientDeliveryError(
+        Object.assign(new Error('Forbidden: bot was blocked by the user'), {
+          type: 'ValidationError',
+        }),
+      ),
+    ).toBe(false);
+    expect(isTransientDeliveryError(new Error('unauthorized channel destination: ag-1 cannot send to ...'))).toBe(
+      false,
+    );
+    expect(isTransientDeliveryError(new Error('unknown messaging group for telegram/telegram:1'))).toBe(false);
+    expect(isTransientDeliveryError(Object.assign(new Error('x'), { status: 400 }))).toBe(false);
+    expect(isTransientDeliveryError(null)).toBe(false);
+    expect(isTransientDeliveryError('boom')).toBe(false);
   });
 });
 
