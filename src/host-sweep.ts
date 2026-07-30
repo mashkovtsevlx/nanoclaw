@@ -146,7 +146,13 @@ async function sweep(): Promise<void> {
   try {
     const sessions = getActiveSessions();
     for (const session of sessions) {
-      await sweepSession(session);
+      // Isolate each session: a throw sweeping one session must not abort the
+      // loop and prevent every session after it from being swept/woken.
+      try {
+        await sweepSession(session);
+      } catch (err) {
+        log.error('Host sweep error', { sessionId: session.id, err });
+      }
     }
   } catch (err) {
     log.error('Host sweep error', { err });
@@ -257,7 +263,7 @@ async function sweepSession(session: Session): Promise<void> {
           .get() as { c: number }
       ).c;
       if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
-        updateSession(session.id, { status: 'closed' });
+        updateSession(session.id, { status: 'closed', container_status: 'stopped' });
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
     }

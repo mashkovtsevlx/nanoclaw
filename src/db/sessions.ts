@@ -115,7 +115,17 @@ export function getActiveSessions(): Session[] {
 }
 
 export function getRunningSessions(): Session[] {
-  return getDb().prepare("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')").all() as Session[];
+  // Require status='active' as well as a live container_status. A session that
+  // has been closed (e.g. a spent task session GC'd by host-sweep) may still
+  // carry a stale container_status='running' if close didn't reset it. Without
+  // the status guard, delivery's active poll keeps draining a dead session's
+  // outbound.db forever - and if that DB was left with a hot journal by a
+  // container that died mid-write, every read throws "attempt to write a
+  // readonly database" (the host opens outbound.db read-only, so SQLite can't
+  // roll the journal back), poisoning the whole poll loop.
+  return getDb()
+    .prepare("SELECT * FROM sessions WHERE status = 'active' AND container_status IN ('running', 'idle')")
+    .all() as Session[];
 }
 
 export function updateSession(

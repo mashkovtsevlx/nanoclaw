@@ -370,6 +370,24 @@ describe('sessions', () => {
     expect(getRunningSessions()).toHaveLength(2);
   });
 
+  it('should exclude closed sessions even if container_status is stale-running', () => {
+    // Regression: a closed session that kept a stale container_status='running'
+    // (close didn't reset it) must NOT be returned - otherwise the delivery
+    // active poll drains a dead session's outbound.db forever, and a hot
+    // journal left by a container that died mid-write poisons the whole loop.
+    createSession({ ...sess(), container_status: 'running' });
+    createSession({
+      ...sess(),
+      id: 'sess-closed-running',
+      status: 'closed',
+      container_status: 'running',
+      thread_id: 'thread-z',
+    });
+    const running = getRunningSessions();
+    expect(running).toHaveLength(1);
+    expect(running[0]!.id).toBe('sess-1');
+  });
+
   it('should update', () => {
     createSession(sess());
     updateSession('sess-1', { container_status: 'running', last_active: now() });

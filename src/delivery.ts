@@ -29,10 +29,96 @@ import type { Session } from './types.js';
 
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
-const MAX_DELIVERY_ATTEMPTS = 3;
 
-/** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
-const deliveryAttempts = new Map<string, number>();
+// Delivery retry policy.
+//
+// A failed send is retried on subsequent polls. How long we keep retrying
+// depends on whether the failure looks transient:
+//
+//   - Permanent (structural: message too long / empty, chat not found, bot
+//     blocked, unauthorized destination): retrying can't help, so give up
+//     after MAX_PERMANENT_ATTEMPTS and mark the message failed.
+//   - Transient (network blip, timeout, connection reset, 5xx, 429, or a
+//     truncated-request "can't parse entities" 400): a brief connectivity gap
+//     must not permanently drop an agent's reply, so retry with exponential
+//     backoff until TRANSIENT_RETRY_HORIZON_MS has elapsed since the first
+//     failure. On a flaky uplink this is the difference between a delayed
+//     reply and a silently lost one (see #2423).
+//
+// Unrecognized errors are treated as permanent: we only extend the retry
+// horizon when we're confident a failure is transient, so an unknown
+// deterministic error can never wedge the queue in an unbounded retry loop.
+const MAX_PERMANENT_ATTEMPTS = 3;
+const TRANSIENT_RETRY_HORIZON_MS = 30 * 60_000;
+const RETRY_BACKOFF_BASE_MS = 1000;
+const RETRY_BACKOFF_CAP_MS = 60_000;
+
+interface DeliveryAttemptState {
+  attempts: number;
+  /** Epoch ms of the first failure — bounds the transient retry horizon. */
+  firstFailedAt: number;
+  /** Epoch ms before which the message should not be retried (backoff). */
+  nextRetryAt: number;
+}
+
+/** Per-message delivery attempt state. Cleared on success, permanent failure,
+ *  or process restart (a restart gives failed messages a fresh chance). */
+const deliveryAttempts = new Map<string, DeliveryAttemptState>();
+
+/** Exponential backoff (ms) for retry attempt N (1-based), capped. */
+function retryBackoffMs(attempts: number): number {
+  return Math.min(RETRY_BACKOFF_BASE_MS * 2 ** (attempts - 1), RETRY_BACKOFF_CAP_MS);
+}
+
+/**
+ * Classify a delivery error as transient (worth retrying past the permanent
+ * cap, with backoff) or permanent (give up quickly). Network-level failures,
+ * timeouts, 429/5xx responses, and truncated-request parse errors are
+ * transient; everything else — including unrecognized errors — is treated as
+ * permanent so the retry loop stays bounded. Exported for unit testing.
+ */
+export function isTransientDeliveryError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    name?: unknown;
+    type?: unknown;
+    code?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+    message?: unknown;
+  };
+  const tag = `${String(e.type ?? '')} ${String(e.name ?? '')}`.toLowerCase();
+  const message = String(e.message ?? '').toLowerCase();
+  if (tag.includes('network') || tag.includes('timeout')) return true;
+  // A "can't parse entities" / "can't find end of a URL|entity" 400 on
+  // formatter-generated markup indicates the request was truncated in transit
+  // (a lossy uplink), not bad content — the converter escapes its own output,
+  // so a well-formed message can't produce a parse error except mid-send. Retry
+  // these; only genuinely-structural validation errors below are permanent.
+  if (/can.?t parse entities|cannot parse entities|can.?t find end of|unexpected end of/.test(message)) return true;
+  // Other validation errors (message too long / empty, chat not found, bot
+  // blocked, insufficient rights) can't be fixed by retrying.
+  if (tag.includes('validation')) return false;
+  const code = String(e.code ?? '').toUpperCase();
+  if (
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    code === 'ECONNREFUSED' ||
+    code === 'ENETUNREACH' ||
+    code === 'ENETDOWN' ||
+    code === 'EAI_AGAIN' ||
+    code === 'EPIPE' ||
+    code === 'ECONNABORTED' ||
+    code.startsWith('UND_ERR')
+  ) {
+    return true;
+  }
+  const status = typeof e.status === 'number' ? e.status : typeof e.statusCode === 'number' ? e.statusCode : undefined;
+  if (status !== undefined && (status === 408 || status === 429 || status >= 500)) return true;
+  return /\b(network|timed?\s?out|timeout|socket hang up|fetch failed|connection (?:reset|refused|closed|timed out)|econnreset|etimedout|enetunreach|eai_again|temporarily|rate limit|too many requests)\b/.test(
+    message,
+  );
+}
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -127,7 +213,14 @@ async function pollActive(): Promise<void> {
   try {
     const sessions = getRunningSessions();
     for (const session of sessions) {
-      await deliverSessionMessages(session);
+      // Isolate each session: a throw draining one session (e.g. a poisoned
+      // outbound.db) must not abort the loop and starve every session after
+      // it in iteration order.
+      try {
+        await deliverSessionMessages(session);
+      } catch (err) {
+        log.error('Active delivery poll error', { sessionId: session.id, err });
+      }
     }
   } catch (err) {
     log.error('Active delivery poll error', { err });
@@ -142,7 +235,12 @@ async function pollSweep(): Promise<void> {
   try {
     const sessions = getActiveSessions();
     for (const session of sessions) {
-      await deliverSessionMessages(session);
+      // Per-session isolation - see pollActive.
+      try {
+        await deliverSessionMessages(session);
+      } catch (err) {
+        log.error('Sweep delivery poll error', { sessionId: session.id, err });
+      }
     }
   } catch (err) {
     log.error('Sweep delivery poll error', { err });
@@ -191,6 +289,11 @@ async function drainSession(session: Session): Promise<void> {
     migrateDeliveredTable(inDb);
 
     for (const msg of undelivered) {
+      // Honor per-message backoff: a message that just failed a transient
+      // send is not retried until its backoff window has elapsed.
+      const backoffState = deliveryAttempts.get(msg.id);
+      if (backoffState && backoffState.nextRetryAt > Date.now()) continue;
+
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
@@ -206,23 +309,36 @@ async function drainSession(session: Session): Promise<void> {
           pauseTypingRefreshAfterDelivery(session.id);
         }
       } catch (err) {
-        const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
-        deliveryAttempts.set(msg.id, attempts);
-        if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+        const prev = deliveryAttempts.get(msg.id);
+        const now = Date.now();
+        const attempts = (prev?.attempts ?? 0) + 1;
+        const firstFailedAt = prev?.firstFailedAt ?? now;
+        const transient = isTransientDeliveryError(err);
+        // Transient failures retry until the time horizon elapses; permanent
+        // failures give up after a small fixed cap. Either way, once we give
+        // up the message is marked failed and never retried again.
+        const giveUp = transient
+          ? now - firstFailedAt >= TRANSIENT_RETRY_HORIZON_MS
+          : attempts >= MAX_PERMANENT_ATTEMPTS;
+        if (giveUp) {
           log.error('Message delivery failed permanently, giving up', {
             messageId: msg.id,
             sessionId: session.id,
             attempts,
+            transient,
             err,
           });
           markDeliveryFailed(inDb, msg.id);
           deliveryAttempts.delete(msg.id);
         } else {
+          const retryInMs = transient ? retryBackoffMs(attempts) : 0;
+          deliveryAttempts.set(msg.id, { attempts, firstFailedAt, nextRetryAt: now + retryInMs });
           log.warn('Message delivery failed, will retry', {
             messageId: msg.id,
             sessionId: session.id,
             attempt: attempts,
-            maxAttempts: MAX_DELIVERY_ATTEMPTS,
+            transient,
+            retryInMs,
             err,
           });
         }
